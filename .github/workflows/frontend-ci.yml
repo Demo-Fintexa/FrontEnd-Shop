@@ -1,13 +1,13 @@
 name: Frontend CI/CD Pipeline
 
-# TRIGGER: Se ejecuta en push a branches principales o en creacion de tags
+# Aca se ejecuta si tiene una rama nueva o si tiene un tag ya sea dev o test
 on:
   push:
     branches: [ main, master ]
     tags:
-      - 'v*-dev'    # Tags que terminan en -dev van a namespace dev
-      - 'v*-test'   # Tags que terminan en -test van a namespace test
-
+      - 'v*-dev'
+      - 'v*-test'
+#Variables de entorno de el repo mi usuario de docker y la imagen con la que quiero jugar
 env:
   DOCKER_USERNAME: facundo676
   IMAGE_NAME: frontend-shop
@@ -15,20 +15,18 @@ env:
   CI: false
 
 jobs:
-  # ============================================================
-  # JOB 1: BUILD AND PUBLISH
-  # Compila la aplicacion, corre tests y publica imagen Docker
-  # ============================================================
+  # JOB 1:
+  # Compila la aplicacion, corre tests y publica imagen Docker osea basicamente todo
   build-and-publish:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
       short_sha: ${{ steps.meta.outputs.short_sha }}
       environment: ${{ steps.environment.outputs.env }}
-      
+
     steps:
-    # FASE 1: CHECKOUT Y SETUP
-    # Clona el codigo fuente y configura el entorno de Node.js
+    # 1) SETUP
+    # Configura entorno de node
     - name: Checkout frontend code
       uses: actions/checkout@v4
 
@@ -38,8 +36,8 @@ jobs:
         node-version: '18'
         cache: 'npm'
 
-    # FASE 2: BUILD DE LA APLICACION
-    # Instala dependencias, corre tests y compila el proyecto React
+    # 2) BUILD DE LA APLICACION
+    # compila el proyecto React
     - name: Install dependencies
       run: npm ci
 
@@ -51,9 +49,8 @@ jobs:
       env:
         CI: false
 
-    # FASE 3: GENERACION DE TAGS Y DETERMINACION DE AMBIENTE
-    # Crea tags basados en timestamp y SHA del commit
-    # Detecta el ambiente de destino segun el tag de Git
+    # 3) GENERACION DE TAGS Y DETERMINACION DE AMBIENTE
+    # La parte mas dificil
     - name: Generate version tags
       id: meta
       run: |
@@ -70,7 +67,7 @@ jobs:
         if [[ "${{ github.ref }}" == refs/tags/* ]]; then
           TAG_NAME=${GITHUB_REF#refs/tags/}
           echo "Tag detectado: $TAG_NAME"
-          
+
           # Verificar si el tag termina en -dev o -test
           if [[ "$TAG_NAME" == *-dev ]]; then
             echo "env=dev" >> $GITHUB_OUTPUT
@@ -88,7 +85,7 @@ jobs:
           echo "No es un tag, saltando deployment"
         fi
 
-    # FASE 4: BUILD Y PUBLICACION DE IMAGEN DOCKER
+    # 4) BUILD Y PUBLICACION DE IMAGEN DOCKER
     # Hace login en DockerHub, construye la imagen y la publica con multiples tags
     - name: Log in to Docker Hub
       if: steps.environment.outputs.env != 'none'
@@ -109,18 +106,16 @@ jobs:
           ${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           ${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
 
-  # ============================================================
   # JOB 2: UPDATE INFRASTRUCTURE REPOSITORY
   # Actualiza el repositorio de infraestructura con el nuevo tag
-  # ArgoCD detectara este cambio y desplegara automaticamente
-  # ============================================================
+  # ArgoCD Va a detectar este cambio y desplegara automaticamente
   update-infrastructure:
     needs: build-and-publish
     runs-on: ubuntu-latest
     if: needs.build-and-publish.outputs.environment != 'none'
-    
+
     steps:
-    # FASE 1: CHECKOUT DEL REPOSITORIO DE INFRAESTRUCTURA
+    # 1) CHECKOUT DEL REPOSITORIO DE INFRAESTRUCTURA
     # Clona el repo de infraestructura donde estan los Helm charts
     - name: Checkout infrastructure repository
       uses: actions/checkout@v4
@@ -129,7 +124,7 @@ jobs:
         token: ${{ secrets.INFRA_TOKEN }}
         path: infra
 
-    # FASE 2: DETERMINACION DE ARCHIVO A ACTUALIZAR
+    # 2) DETERMINACION DE ARCHIVO A ACTUALIZAR
     # Identifica cual values file modificar segun el ambiente
     - name: Determine values file to update
       id: values_file
@@ -146,18 +141,18 @@ jobs:
       run: |
         VALUES_FILE="${{ steps.values_file.outputs.values_file }}"
         NEW_TAG="${{ needs.build-and-publish.outputs.version }}"
-        
+
         echo "Actualizando $VALUES_FILE con tag: $NEW_TAG"
-        
+
         # Verificar que el archivo existe
         if [ ! -f "$VALUES_FILE" ]; then
           echo "ERROR: Archivo $VALUES_FILE no existe"
           exit 1
         fi
-        
+
         # Actualizar el tag usando sed
         sed -i "s|tag: .*|tag: \"$NEW_TAG\"|g" $VALUES_FILE
-        
+
         # Mostrar el cambio
         echo "Cambios realizados:"
         git diff $VALUES_FILE
@@ -170,21 +165,21 @@ jobs:
       run: |
         ENV="${{ needs.build-and-publish.outputs.environment }}"
         VERSION="${{ needs.build-and-publish.outputs.version }}"
-        
+
         # Configurar Git
         git config --local user.email "ci-bot@github.com"
         git config --local user.name "CI Bot"
-        
+
         # Verificar si hay cambios
         if git diff --quiet; then
           echo "No hay cambios para commitear"
           exit 0
         fi
-        
+
         # Mostrar estado
         echo "Archivos modificados:"
         git diff --name-only
-        
+
         # Commit y push
         git add .
         git commit -m "Update frontend ($ENV) to $VERSION
@@ -193,8 +188,8 @@ Automated update by CI pipeline
 - Environment: $ENV
 - Image tag: $VERSION
 - Triggered by: ${{ github.sha }}"
-        
+
         git push
-        
+
         echo "Cambios pusheados exitosamente"
         echo "ArgoCD sincronizara automaticamente en los proximos 3 minutos"
