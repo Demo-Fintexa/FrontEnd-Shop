@@ -1,34 +1,45 @@
-name: Frontend CI/CD
+name: Frontend CI/CD Pipeline
 
+# TRIGGER: Se ejecuta en push a branches principales o en creacion de tags
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    tags:
+      - 'v*-dev'    # Tags que terminan en -dev van a namespace dev
+      - 'v*-test'   # Tags que terminan en -test van a namespace test
 
 env:
   DOCKER_USERNAME: facundo676
   IMAGE_NAME: frontend-shop
-  INFRA_REPO: sudo-init-project/Infra-App-K8s
+  INFRA_REPO: Demo-Fintexa/fintexa-gitops-infra
   CI: false
 
 jobs:
-  build-and-deploy:
+  # ============================================================
+  # JOB 1: BUILD AND PUBLISH
+  # Compila la aplicacion, corre tests y publica imagen Docker
+  # ============================================================
+  build-and-publish:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
       short_sha: ${{ steps.meta.outputs.short_sha }}
+      environment: ${{ steps.environment.outputs.env }}
       
     steps:
+    # FASE 1: CHECKOUT Y SETUP
+    # Clona el codigo fuente y configura el entorno de Node.js
     - name: Checkout frontend code
       uses: actions/checkout@v4
 
     - name: Set up Node.js
-      uses: actions/setup-node@v4
+      uses: actions/checkout@v4
       with:
         node-version: '18'
         cache: 'npm'
 
+    # FASE 2: BUILD DE LA APLICACION
+    # Instala dependencias, corre tests y compila el proyecto React
     - name: Install dependencies
       run: npm ci
 
@@ -40,7 +51,10 @@ jobs:
       env:
         CI: false
 
-    - name: Generate tags
+    # FASE 3: GENERACION DE TAGS Y DETERMINACION DE AMBIENTE
+    # Crea tags basados en timestamp y SHA del commit
+    # Detecta el ambiente de destino segun el tag de Git
+    - name: Generate version tags
       id: meta
       run: |
         SHORT_SHA=${GITHUB_SHA::7}
@@ -48,14 +62,43 @@ jobs:
         echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
         echo "timestamp=${TIMESTAMP}" >> $GITHUB_OUTPUT
         echo "version=${TIMESTAMP}-${SHORT_SHA}" >> $GITHUB_OUTPUT
-       
+
+    - name: Determine target environment
+      id: environment
+      run: |
+        # Extraer el tag completo si existe
+        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          echo "Tag detectado: $TAG_NAME"
+          
+          # Verificar si el tag termina en -dev o -test
+          if [[ "$TAG_NAME" == *-dev ]]; then
+            echo "env=dev" >> $GITHUB_OUTPUT
+            echo "Ambiente destino: dev"
+          elif [[ "$TAG_NAME" == *-test ]]; then
+            echo "env=test" >> $GITHUB_OUTPUT
+            echo "Ambiente destino: test"
+          else
+            echo "ERROR: Tag debe terminar en -dev o -test"
+            exit 1
+          fi
+        else
+          # Si no es un tag, no hacer deploy
+          echo "env=none" >> $GITHUB_OUTPUT
+          echo "No es un tag, saltando deployment"
+        fi
+
+    # FASE 4: BUILD Y PUBLICACION DE IMAGEN DOCKER
+    # Hace login en DockerHub, construye la imagen y la publica con multiples tags
     - name: Log in to Docker Hub
+      if: steps.environment.outputs.env != 'none'
       uses: docker/login-action@v3
       with:
         username: ${{ env.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
 
     - name: Build and push Docker image
+      if: steps.environment.outputs.env != 'none'
       uses: docker/build-push-action@v5
       with:
         context: .
@@ -66,11 +109,19 @@ jobs:
           ${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           ${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
 
-  update-infra:
-    needs: build-and-deploy
+  # ============================================================
+  # JOB 2: UPDATE INFRASTRUCTURE REPOSITORY
+  # Actualiza el repositorio de infraestructura con el nuevo tag
+  # ArgoCD detectara este cambio y desplegara automaticamente
+  # ============================================================
+  update-infrastructure:
+    needs: build-and-publish
     runs-on: ubuntu-latest
-
+    if: needs.build-and-publish.outputs.environment != 'none'
+    
     steps:
+    # FASE 1: CHECKOUT DEL REPOSITORIO DE INFRAESTRUCTURA
+    # Clona el repo de infraestructura donde estan los Helm charts
     - name: Checkout infrastructure repository
       uses: actions/checkout@v4
       with:
@@ -78,64 +129,72 @@ jobs:
         token: ${{ secrets.INFRA_TOKEN }}
         path: infra
 
-    - name: Set up variables
-      id: vars
+    # FASE 2: DETERMINACION DE ARCHIVO A ACTUALIZAR
+    # Identifica cual values file modificar segun el ambiente
+    - name: Determine values file to update
+      id: values_file
       run: |
-        SHORT_SHA=${GITHUB_SHA::7}
-        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-        VERSION="${{ needs.build-and-deploy.outputs.version }}"
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        ENV="${{ needs.build-and-publish.outputs.environment }}"
+        VALUES_FILE="helm-charts/frontend/values-${ENV}.yaml"
+        echo "values_file=${VALUES_FILE}" >> $GITHUB_OUTPUT
+        echo "Archivo a actualizar: ${VALUES_FILE}"
 
-        # Determinar ambiente basado en branch/tag
-        if [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
-          echo "env=staging" >> $GITHUB_OUTPUT
-        elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-          echo "env=production" >> $GITHUB_OUTPUT
-        else
-          echo "env=dev" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Update infrastructure files
+    # FASE 3: ACTUALIZACION DEL TAG EN VALUES FILE
+    # Modifica el campo image.tag en el archivo values correspondiente
+    - name: Update image tag in values file
       working-directory: infra
       run: |
-        ENV="${{ steps.vars.outputs.env }}"
-        NEW_TAG="${{ steps.vars.outputs.version }}"
-
-        echo "🎯 Actualizando ambiente: $ENV"
-        echo "🔍 New tag: $NEW_TAG"
-
-        if [ -f "overlays/$ENV/kustomization.yaml" ]; then
-          echo "📝 Updating overlays/$ENV/kustomization.yaml"
-          sed -i "s|newTag:.*|newTag: $NEW_TAG|g" overlays/$ENV/kustomization.yaml
+        VALUES_FILE="${{ steps.values_file.outputs.values_file }}"
+        NEW_TAG="${{ needs.build-and-publish.outputs.version }}"
+        
+        echo "Actualizando $VALUES_FILE con tag: $NEW_TAG"
+        
+        # Verificar que el archivo existe
+        if [ ! -f "$VALUES_FILE" ]; then
+          echo "ERROR: Archivo $VALUES_FILE no existe"
+          exit 1
         fi
+        
+        # Actualizar el tag usando sed
+        sed -i "s|tag: .*|tag: \"$NEW_TAG\"|g" $VALUES_FILE
+        
+        # Mostrar el cambio
+        echo "Cambios realizados:"
+        git diff $VALUES_FILE
 
-        if [ -f "tags/frontend-tag.yaml" ]; then
-          echo "📝 Updating tags/frontend-tag.yaml"
-          sed -i "s|newTag:.*|newTag: $NEW_TAG|g" tags/frontend-tag.yaml
-        fi
-
-        if [ -f "base/kustomization.yaml" ]; then
-          echo "📝 Updating base/kustomization.yaml"
-          sed -i "s|${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:.*|${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:$NEW_TAG|g" base/kustomization.yaml
-        fi
-
+    # FASE 4: COMMIT Y PUSH AL REPOSITORIO DE INFRAESTRUCTURA
+    # Hace commit de los cambios y los pushea a Git
+    # ArgoCD detectara este cambio en los proximos 3 minutos
     - name: Commit and push changes
       working-directory: infra
       run: |
+        ENV="${{ needs.build-and-publish.outputs.environment }}"
+        VERSION="${{ needs.build-and-publish.outputs.version }}"
+        
+        # Configurar Git
         git config --local user.email "ci-bot@github.com"
         git config --local user.name "CI Bot"
-
+        
+        # Verificar si hay cambios
         if git diff --quiet; then
-          echo "🟢 No changes to commit"
+          echo "No hay cambios para commitear"
           exit 0
         fi
-
-        echo "📋 Changes to be committed:"
+        
+        # Mostrar estado
+        echo "Archivos modificados:"
         git diff --name-only
-        git status
-
+        
+        # Commit y push
         git add .
-        git commit -m "🚀 Update frontend (${{ steps.vars.outputs.env }}) to ${{ steps.vars.outputs.version }}"
-        git push
+        git commit -m "Update frontend ($ENV) to $VERSION
 
-        echo "✅ Successfully updated infrastructure repository"
+Automated update by CI pipeline
+- Environment: $ENV
+- Image tag: $VERSION
+- Triggered by: ${{ github.sha }}"
+        
+        git push
+        
+        echo "Cambios pusheados exitosamente"
+        echo "ArgoCD sincronizara automaticamente en los proximos 3 minutos"
