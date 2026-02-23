@@ -10,7 +10,7 @@ on:
 env:
   DOCKER_USERNAME: facundo676
   IMAGE_NAME: frontend-shop
-  INFRA_REPO: Demo-Fintexa/fintexa-gitops-infra
+  INFRA_REPO: Gitops-Facundoh3/gitops-shop-demo
   CI: false
 
 jobs:
